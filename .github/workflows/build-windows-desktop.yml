@@ -1,0 +1,165 @@
+name: Build Windows Desktop App (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App name matching the dist/<app_name> PyInstaller output folder"
+        required: true
+        type: string
+      spec_file:
+        description: "Path to the PyInstaller .spec file"
+        required: true
+        type: string
+      python_version:
+        description: "Python version to build with"
+        required: false
+        default: "3.13"
+        type: string
+      requirements_file:
+        description: "Path to pip requirements file"
+        required: false
+        default: "requirements.txt"
+        type: string
+      build_go:
+        description: "Set true to compile a Go helper binary before PyInstaller"
+        required: false
+        default: false
+        type: boolean
+      go_version:
+        description: "Go version when build_go is true"
+        required: false
+        default: "1.25"
+        type: string
+      go_dir:
+        description: "Folder containing go.mod and Go source"
+        required: false
+        default: ""
+        type: string
+      go_output:
+        description: "Output .exe path relative to repo root (referenced by your .spec file)"
+        required: false
+        default: ""
+        type: string
+      bundle_ahk_v2:
+        description: "Set true to download and stage portable AutoHotkey64.exe (v2)"
+        required: false
+        default: false
+        type: boolean
+      ahk_version:
+        description: "Pinned AutoHotkey v2 release version"
+        required: false
+        default: "2.0.31"
+        type: string
+      ahk_dest:
+        description: "Destination folder for AutoHotkey64.exe (referenced by your .spec file)"
+        required: false
+        default: "vendor/ahk"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: "pip"
+          cache-dependency-path: ${{ inputs.requirements_file }}
+
+      - name: Install Python dependencies and PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path "${{ inputs.requirements_file }}") {
+            pip install -r "${{ inputs.requirements_file }}"
+          }
+          pip install pyinstaller
+
+      - name: Set up Go
+        if: ${{ inputs.build_go }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache-dependency-path: "${{ inputs.go_dir }}/go.sum"
+
+      - name: Compile Go binary
+        if: ${{ inputs.build_go }}
+        shell: pwsh
+        run: |
+          $outPath = Join-Path $PWD "${{ inputs.go_output }}"
+          $outDir = Split-Path -Parent $outPath
+          if (-not (Test-Path $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          }
+          Push-Location "${{ inputs.go_dir }}"
+          try {
+            $env:GOOS = "windows"
+            $env:GOARCH = "amd64"
+            go build -trimpath -ldflags="-s -w" -o $outPath .
+          } finally {
+            Pop-Location
+          }
+          if (-not (Test-Path $outPath)) {
+            throw "Go build finished without producing $outPath"
+          }
+
+      - name: Stage portable AutoHotkey v2 runtime
+        if: ${{ inputs.bundle_ahk_v2 }}
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.ahk_version }}"
+          $zip = Join-Path $env:RUNNER_TEMP "AutoHotkey_$ver.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "ahk_$ver"
+          $url = "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$ver/AutoHotkey_$ver.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extractDir -Force
+
+          $ahkExe = Join-Path $extractDir "AutoHotkey64.exe"
+          if (-not (Test-Path $ahkExe)) {
+            throw "AutoHotkey64.exe was not found in AutoHotkey_$ver.zip"
+          }
+
+          New-Item -ItemType Directory -Path "${{ inputs.ahk_dest }}" -Force | Out-Null
+          Copy-Item -Path $ahkExe -Destination (Join-Path "${{ inputs.ahk_dest }}" "AutoHotkey64.exe") -Force
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconfirm "${{ inputs.spec_file }}"
+
+      - name: Package release ZIP and SHA-256 checksum
+        shell: pwsh
+        run: |
+          $app = "${{ inputs.app_name }}"
+          $ver = "${{ github.ref_name }}"
+          $distDir = Join-Path "dist" $app
+
+          if (-not (Test-Path $distDir)) {
+            throw "Expected PyInstaller output folder not found: $distDir"
+          }
+
+          New-Item -ItemType Directory -Path "release" -Force | Out-Null
+          $zipName = "$app-$ver-win64.zip"
+          $zipPath = Join-Path "release" $zipName
+
+          Compress-Archive -Path $distDir -DestinationPath $zipPath -Force
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zipName" | Out-File -FilePath "release/$app-$ver-win64.sha256.txt" -Encoding ascii
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            release/*.zip
+            release/*.sha256.txt
